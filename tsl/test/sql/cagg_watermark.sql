@@ -2,6 +2,8 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
+\set EXPLAIN_ANALYZE 'EXPLAIN (analyze,costs off,timing off,summary off)'
+
 CREATE TABLE continuous_agg_test(time int, data int);
 select create_hypertable('continuous_agg_test', 'time', chunk_time_interval=> 10);
 CREATE OR REPLACE FUNCTION integer_now_test1() returns int LANGUAGE SQL STABLE as $$ SELECT coalesce(max(time), 0) FROM continuous_agg_test $$;
@@ -195,6 +197,137 @@ SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
 SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
 
 DROP TABLE ts_continuous_test CASCADE;
+
+----
+-- Test watermark invalidation and chunk exclusion with prepared and ad-hoc queries
+----
+CREATE TABLE chunks(time timestamptz, device int, value float);
+SELECT FROM create_hypertable('chunks','time',chunk_time_interval:='1d'::interval);
+
+CREATE MATERIALIZED VIEW chunks_hourly WITH (timescaledb.continuous)
+    AS SELECT time_bucket('1 hour', time) AS bucket, device, avg(value) FROM chunks GROUP BY bucket, device;
+
+ALTER MATERIALIZED VIEW chunks_hourly set (timescaledb.materialized_only = false);
+
+-- Get id fg the materialization hypertable
+SELECT id AS "MAT_HT_ID" FROM _timescaledb_catalog.hypertable
+    WHERE table_name=(
+        SELECT materialization_hypertable_name
+            FROM timescaledb_information.continuous_aggregates
+            WHERE view_name='chunks_hourly'
+    ) \gset
+
+
+SELECT materialization_hypertable_schema || '.' || materialization_hypertable_name AS "MAT_HT_NAME"
+    FROM timescaledb_information.continuous_aggregates
+    WHERE view_name='chunks_hourly'
+\gset
+
+-- Prepared scan on hypertable (identical to the query of a real-time CAgg)
+PREPARE ht_scan_realtime AS
+   SELECT bucket, device, avg
+   FROM :MAT_HT_NAME
+  WHERE bucket < COALESCE(_timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID)), '-infinity'::timestamp with time zone)
+UNION ALL
+ SELECT time_bucket('01:00:00'::interval, chunks."time") AS bucket,
+    chunks.device,
+    avg(chunks.value) AS avg
+   FROM chunks
+  WHERE chunks."time" >= COALESCE(_timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID)), '-infinity'::timestamp with time zone)
+  GROUP BY (time_bucket('01:00:00'::interval, chunks."time")), chunks.device;
+
+PREPARE cagg_scan AS SELECT * FROM chunks_hourly;
+
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+INSERT INTO chunks VALUES ('1901-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+SELECT * FROM _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID));
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+-- Compare prepared statement with ad-hoc query
+EXECUTE cagg_scan;
+SELECT * FROM chunks_hourly;
+
+-- Add new chunks to the unmaterialized part of the CAgg
+INSERT INTO chunks VALUES ('1910-08-01 01:01:01+01', 1, 2);
+:EXPLAIN_ANALYZE EXECUTE cagg_scan;
+:EXPLAIN_ANALYZE SELECT * FROM chunks_hourly;
+
+INSERT INTO chunks VALUES ('1911-08-01 01:01:01+01', 1, 2);
+:EXPLAIN_ANALYZE EXECUTE cagg_scan;
+:EXPLAIN_ANALYZE SELECT * FROM chunks_hourly;
+
+-- Materialize CAgg and check for plan time chunk exclusion
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+:EXPLAIN_ANALYZE EXECUTE cagg_scan;
+:EXPLAIN_ANALYZE SELECT * FROM chunks_hourly;
+
+-- Check plan when chunk_append and constraint_aware_append cannot be used
+-- There should be no plans for scans of chunks that are materialized in the CAgg
+-- on the underlying hypertable
+SET timescaledb.enable_chunk_append = OFF;
+SET timescaledb.enable_constraint_aware_append = OFF;
+:EXPLAIN_ANALYZE SELECT * FROM chunks_hourly;
+RESET timescaledb.enable_chunk_append;
+RESET timescaledb.enable_constraint_aware_append;
+
+-- Insert new values and check watermark changes
+INSERT INTO chunks VALUES ('1920-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+SELECT * FROM _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID));
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+-- Compare prepared statement with ad-hoc query
+EXECUTE cagg_scan;
+SELECT * FROM chunks_hourly;
+
+INSERT INTO chunks VALUES ('1930-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+SELECT * FROM _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID));
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+-- Two invalidations without prepared statement execution between
+INSERT INTO chunks VALUES ('1931-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+INSERT INTO chunks VALUES ('1932-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+SELECT * FROM _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID));
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+-- Multiple prepared statement executions followed by one invalidation
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+INSERT INTO chunks VALUES ('1940-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+-- Compare prepared statement with ad-hoc query
+EXECUTE cagg_scan;
+SELECT * FROM chunks_hourly;
+
+-- Delete data from hypertable - data is only present in cagg after this point. If the watermark in the prepared
+-- statement is not moved to the most-recent watermark, we would see an empty result.
+TRUNCATE chunks;
+
+EXECUTE cagg_scan;
+SELECT * FROM chunks_hourly;
+
+-- Refresh the CAgg
+CALL refresh_continuous_aggregate('chunks_hourly', NULL, NULL);
+EXECUTE cagg_scan;
+SELECT * FROM chunks_hourly;
+
+-- Check new watermark
+SELECT * FROM _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID));
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
+-- Update after truncate
+INSERT INTO chunks VALUES ('1950-08-01 01:01:01+01', 1, 2);
+CALL refresh_continuous_aggregate('chunks_hourly', '1900-01-01', '2021-06-01');
+SELECT * FROM _timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(:MAT_HT_ID));
+:EXPLAIN_ANALYZE EXECUTE ht_scan_realtime;
+
 \c :TEST_DBNAME :ROLE_SUPERUSER
 TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
 TRUNCATE _timescaledb_catalog.continuous_aggs_invalidation_threshold;

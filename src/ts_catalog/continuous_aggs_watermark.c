@@ -13,6 +13,7 @@
 #include <fmgr.h>
 #include <miscadmin.h>
 #include <utils/acl.h>
+#include <utils/inval.h>
 #include <utils/snapmgr.h>
 
 #include "ts_catalog/continuous_agg.h"
@@ -357,7 +358,8 @@ cagg_watermark_update_scan_internal(TupleInfo *ti, void *data)
 }
 
 static void
-cagg_watermark_update_internal(int32 mat_hypertable_id, int64 new_watermark, bool force_update)
+cagg_watermark_update_internal(int32 mat_hypertable_id, Oid ht_relid, int64 new_watermark,
+							   bool force_update, bool invalidate_rel_cache)
 {
 	bool watermark_updated;
 	ScanKeyData scankey[1];
@@ -384,6 +386,19 @@ cagg_watermark_update_internal(int32 mat_hypertable_id, int64 new_watermark, boo
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("watermark not defined for continuous aggregate: %d", mat_hypertable_id)));
 	}
+
+	/*
+	 * We claim that '_timescaledb_functions.cagg_watermark' is IMMUTABLE. However, that is not
+	 * entirely true but needed for constification of the function value and plan-time chunk
+	 * exclusion. The value of the cagg_watermark function changes as soon as we change the
+	 * watermark (so the function value is STABLE, but for this volatility classification, no plan
+	 * time evaluation and chunk exclusion can be performed).
+	 *
+	 * Send an invalidation for the hypertable to invalidate prepared statements on this
+	 * table and force a re-planning using the new watermark.
+	 */
+	if (invalidate_rel_cache)
+		CacheInvalidateRelcacheByRelid(ht_relid);
 }
 
 TSDLLEXPORT void
@@ -397,8 +412,17 @@ ts_cagg_watermark_update(Hypertable *mat_ht, int64 watermark, bool watermark_isn
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid materialized hypertable ID: %d", mat_ht->fd.id)));
 
+	/* If we have a real-time CAgg, it uses a watermark function. So, we have to invalidate the rel
+	 * cache to force a replanning of prepared statements. See cagg_watermark_update_internal for
+	 * more information. */
+	bool invalidate_rel_cache = !cagg->data.materialized_only;
+
 	watermark = cagg_compute_watermark(cagg, watermark, watermark_isnull);
-	cagg_watermark_update_internal(mat_ht->fd.id, watermark, force_update);
+	cagg_watermark_update_internal(mat_ht->fd.id,
+								   mat_ht->main_table_relid,
+								   watermark,
+								   force_update,
+								   invalidate_rel_cache);
 
 	return;
 }
